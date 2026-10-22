@@ -48,5 +48,19 @@ StreamBufferHandle_t audio_mem_stream_buffer_create(size_t size, size_t trigger_
 
 void audio_mem_stream_buffer_delete(StreamBufferHandle_t buffer)
 {
-    if (buffer) vStreamBufferDeleteWithCaps(buffer);
+    if (buffer == NULL) return;
+    /* WithCaps creates a static StreamBuffer control object and separately
+     * allocated storage. IDF 6.1's WithCaps deletion helper dispatches the
+     * stream-buffer branch to vSemaphoreDelete(), treating it as a Queue and
+     * potentially freeing the control object twice. Use the matching public
+     * StreamBuffer destructor, then release the two allocations we own.
+     */
+    StaticStreamBuffer_t *control = NULL;
+    uint8_t *storage = NULL;
+    BaseType_t result = xStreamBufferGetStaticBuffers(buffer, &storage, &control);
+    configASSERT(result == pdTRUE);
+    if (result != pdTRUE) return;
+    vStreamBufferDelete(buffer);
+    heap_caps_free(control);
+    heap_caps_free(storage);
 }
