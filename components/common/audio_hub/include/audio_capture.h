@@ -31,6 +31,9 @@ typedef struct {
     uint8_t  bits;
     uint32_t frame_ms;
     uint32_t ring_frames;   /* per-subscriber ring depth */
+    /* Optional per-source weights when a subscriber requests mono. */
+    float mono_weights[8];
+    uint8_t mono_weight_count;
 } audio_capture_config_t;
 
 typedef struct {

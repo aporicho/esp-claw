@@ -27,6 +27,11 @@
 #include "dev_audio_codec.h"
 #include "audio_memory.h"
 
+static portMUX_TYPE s_reference_lock=portMUX_INITIALIZER_UNLOCKED;
+static audio_mixer_reference_cb_t s_reference_callback;
+static void *s_reference_ctx;
+void audio_mixer_set_reference_callback(audio_mixer_reference_cb_t callback,void *ctx)
+{portENTER_CRITICAL(&s_reference_lock);s_reference_callback=callback;s_reference_ctx=ctx;portEXIT_CRITICAL(&s_reference_lock);}
 static const char *TAG = "audio_mixer";
 
 #define AUDIO_MIXER_TASK_PRIO         10
@@ -194,6 +199,11 @@ static void mixer_task(void *arg)
             continue;
         }
 
+        portENTER_CRITICAL(&s_reference_lock);
+        audio_mixer_reference_cb_t reference=s_reference_callback;void *reference_ctx=s_reference_ctx;
+        portEXIT_CRITICAL(&s_reference_lock);
+        if(reference && m->cfg.sample_rate==16000 && m->cfg.channels==1 && m->cfg.bits==16)
+            reference((const int16_t *)m->scratch_out,m->samples_per_frame,reference_ctx);
         int wret = esp_codec_dev_write(m->codec_dev, m->scratch_out, (int)m->frame_bytes);
         if (wret != ESP_CODEC_DEV_OK) {
             ESP_LOGD(TAG, "codec_dev_write=%d", wret);

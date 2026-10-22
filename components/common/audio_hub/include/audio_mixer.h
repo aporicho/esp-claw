@@ -49,6 +49,10 @@ esp_err_t audio_mixer_track_flush(audio_mixer_track_handle_t track);
 esp_err_t audio_mixer_track_stop (audio_mixer_track_handle_t track);
 esp_err_t audio_mixer_track_info(audio_mixer_track_handle_t track, uint32_t *sample_rate, uint8_t *channels, uint8_t *bits);
 
+/* Final 16kHz mono PCM before the codec write. Permanent, nonblocking observer. */
+typedef void (*audio_mixer_reference_cb_t)(const int16_t *pcm,size_t samples,void *ctx);
+void audio_mixer_set_reference_callback(audio_mixer_reference_cb_t callback,void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

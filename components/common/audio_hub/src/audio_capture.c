@@ -225,6 +225,10 @@ static esp_err_t sub_build_conv(struct audio_capture_subscriber *s, const struct
             .weight          = NULL,
             .weight_len      = 0,
         };
+        if (tgt->channels == 1 && hub_cfg->mono_weight_count == stage_ch && stage_ch <= 8) {
+            cfg.weight = (float *)hub_cfg->mono_weights;
+            cfg.weight_len = stage_ch;
+        }
         esp_ae_err_t aerr = esp_ae_ch_cvt_open(&cfg, &s->ch_cvt);
         if (aerr != ESP_AE_ERR_OK || s->ch_cvt == NULL) {
             ESP_LOGE(TAG, "ch_cvt_open failed: %d", (int)aerr);
