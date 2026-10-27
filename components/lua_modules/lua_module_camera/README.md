@@ -46,6 +46,8 @@ Returns an array of currently available capture devices:
 Pass a device's `path` to `camera.open()`. `capabilities` is a device-provided
 bitmask; this module does not provide constants for decoding it.
 
+The camera remains in use until `camera.close()` or job exit; garbage collection alone does not close it. If close fails, retry it before another job opens the camera. Frame objects have separate cleanup requirements, described below.
+
 ## Open and close
 
 ### `camera.open(dev_path [, opts])`

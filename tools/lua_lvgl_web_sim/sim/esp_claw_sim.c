@@ -4,7 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <ctype.h>
+#include <errno.h>
+#include <unistd.h>
 #include <math.h>
+#include <malloc.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -20,12 +23,11 @@
 #include <lualib.h>
 
 #include "lua_module_lvgl.h"
+#include "lua_display_sim.h"
+#include "display_service.h"
 
 extern esp_err_t lua_lvgl_deinit_runtime(void);
 extern void sim_esp_compat_pump_once(void);
-
-#define SIM_DEFAULT_WIDTH 800
-#define SIM_DEFAULT_HEIGHT 480
 
 typedef struct {
     uint8_t r;
@@ -35,9 +37,6 @@ typedef struct {
 } sim_color_t;
 
 static lua_State *s_lua;
-static const uintptr_t SIM_PANEL_HANDLE = 0xEC1A0001u;
-static const uintptr_t SIM_IO_HANDLE = 0xEC1A0002u;
-static const uintptr_t SIM_AUDIO_CODEC_HANDLE = 0xEC1A0004u;
 
 static bool sim_stop_requested(void)
 {
@@ -102,6 +101,12 @@ static void sim_ensure_dir(const char *path)
 
 static void sim_ensure_runtime_dirs(void)
 {
+    sim_ensure_dir("/system/fonts");
+    /* Match the firmware default font path without duplicating the bundled TTF. */
+    if (access("/system/fonts/NotoSansSC-Regular-sub.ttf", F_OK) != 0 &&
+            symlink("/fonts/NotoSansSC-Regular.ttf", "/system/fonts/NotoSansSC-Regular-sub.ttf") != 0) {
+        fprintf(stderr, "[sim] default font alias failed: %s\n", strerror(errno));
+    }
     sim_ensure_dir("/app");
     sim_ensure_dir("/storage");
     sim_ensure_dir("/tmp");
@@ -196,22 +201,6 @@ static int sim_polled_touch_delta_y(void)
     });
 }
 
-static int sim_canvas_width(void)
-{
-    int width = EM_ASM_INT({
-        return Module.canvas ? (Module.canvas.width | 0) : 0;
-    });
-    return width > 0 ? width : SIM_DEFAULT_WIDTH;
-}
-
-static int sim_canvas_height(void)
-{
-    int height = EM_ASM_INT({
-        return Module.canvas ? (Module.canvas.height | 0) : 0;
-    });
-    return height > 0 ? height : SIM_DEFAULT_HEIGHT;
-}
-
 static void sim_canvas_clear(sim_color_t color)
 {
     EM_ASM({
@@ -265,25 +254,20 @@ static bool get_int_field(lua_State *L, int index, const char *field, int *out)
     return found;
 }
 
-static int lua_board_get_display_lcd_params(lua_State *L)
+static int lua_board_get_board_info(lua_State *L)
 {
-    (void)luaL_optstring(L, 1, "display_lcd");
-    lua_pushlightuserdata(L, (void *)SIM_PANEL_HANDLE);
-    lua_pushlightuserdata(L, (void *)SIM_IO_HANDLE);
-    lua_pushinteger(L, sim_canvas_width());
-    lua_pushinteger(L, sim_canvas_height());
-    lua_pushinteger(L, 1);
-    return 5;
-}
-
-static int lua_board_get_audio_codec_output_params(lua_State *L)
-{
-    (void)luaL_optstring(L, 1, "audio_dac");
-    lua_pushlightuserdata(L, (void *)SIM_AUDIO_CODEC_HANDLE);
-    lua_pushinteger(L, 16000);
-    lua_pushinteger(L, 1);
-    lua_pushinteger(L, 16);
-    return 4;
+    lua_newtable(L);
+    lua_pushstring(L, "esp_claw_web_sim");
+    lua_setfield(L, -2, "name");
+    lua_pushstring(L, "wasm");
+    lua_setfield(L, -2, "chip");
+    lua_pushstring(L, "");
+    lua_setfield(L, -2, "version");
+    lua_pushstring(L, "ESP-Claw browser simulator");
+    lua_setfield(L, -2, "description");
+    lua_pushstring(L, "");
+    lua_setfield(L, -2, "manufacturer");
+    return 1;
 }
 
 static int lua_board_get_camera_paths(lua_State *L)
@@ -291,26 +275,17 @@ static int lua_board_get_camera_paths(lua_State *L)
     lua_newtable(L);
     lua_pushstring(L, "/dev/sim_camera0");
     lua_setfield(L, -2, "dev_path");
-    lua_pushstring(L, "/dev/sim_camera0");
-    lua_setfield(L, -2, "path");
     return 1;
 }
 
 static int luaopen_board_manager(lua_State *L)
 {
-    lua_newtable(L);
-    lua_pushcfunction(L, lua_board_get_display_lcd_params);
-    lua_setfield(L, -2, "get_display_lcd_params");
-    lua_pushcfunction(L, lua_board_get_audio_codec_output_params);
-    lua_setfield(L, -2, "get_audio_codec_output_params");
-    lua_pushcfunction(L, lua_board_get_camera_paths);
-    lua_setfield(L, -2, "get_camera_paths");
-    lua_pushinteger(L, 0);
-    lua_setfield(L, -2, "PANEL_IF_IO");
-    lua_pushinteger(L, 1);
-    lua_setfield(L, -2, "PANEL_IF_RGB");
-    lua_pushinteger(L, 2);
-    lua_setfield(L, -2, "PANEL_IF_MIPI_DSI");
+    static const luaL_Reg funcs[] = {
+        {"get_board_info", lua_board_get_board_info},
+        {"get_camera_paths", lua_board_get_camera_paths},
+        {NULL, NULL},
+    };
+    luaL_newlib(L, funcs);
     return 1;
 }
 
@@ -849,6 +824,14 @@ static int lua_system_millis(lua_State *L)
     return 1;
 }
 
+static int lua_system_time(lua_State *L)
+{
+    time_t now = time(NULL);
+    if (now == (time_t)-1) return luaL_error(L, "system time unavailable");
+    lua_pushinteger(L, (lua_Integer)now);
+    return 1;
+}
+
 static int lua_system_date(lua_State *L)
 {
     const char *fmt = luaL_optstring(L, 1, "%c");
@@ -867,6 +850,7 @@ static int luaopen_system(lua_State *L)
 {
     static const luaL_Reg funcs[] = {
         {"millis", lua_system_millis},
+        {"time", lua_system_time},
         {"date", lua_system_date},
         {NULL, NULL},
     };
@@ -902,11 +886,28 @@ static int lua_true_noop(lua_State *L)
     return 1;
 }
 
+/* No physical button events are generated in the browser. */
+static int lua_button_on(lua_State *L)
+{
+    luaL_checktype(L, 1, LUA_TTABLE);
+    luaL_checkstring(L, 2);
+    luaL_checktype(L, 3, LUA_TFUNCTION);
+    return lua_true_noop(L);
+}
+
+static int lua_button_dispatch(lua_State *L)
+{
+    lua_pushinteger(L, 0);
+    return 1;
+}
+
 static int luaopen_button(lua_State *L)
 {
     static const luaL_Reg funcs[] = {
         {"new", lua_button_new},
         {"get_key_level", lua_button_get_key_level},
+        {"on", lua_button_on},
+        {"dispatch", lua_button_dispatch},
         {"close", lua_true_noop},
         {"off", lua_true_noop},
         {NULL, NULL},
@@ -916,29 +917,102 @@ static int luaopen_button(lua_State *L)
     return 1;
 }
 
-static int lua_imu_read(lua_State *L)
+static void lua_imu_check_open(lua_State *L)
 {
     luaL_checktype(L, 1, LUA_TTABLE);
+    lua_getfield(L, 1, "closed");
+    bool closed = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    luaL_argcheck(L, !closed, 1, "closed IMU handle");
+}
+
+static int lua_imu_close(lua_State *L)
+{
+    luaL_checktype(L, 1, LUA_TTABLE);
+    lua_pushboolean(L, true);
+    lua_setfield(L, 1, "closed");
+    return 0;
+}
+
+static int lua_imu_name(lua_State *L)
+{
+    lua_imu_check_open(L);
+    lua_getfield(L, 1, "sensor_name");
+    return 1;
+}
+
+static int lua_imu_zero(lua_State *L)
+{
+    lua_imu_check_open(L);
+    lua_pushinteger(L, 0);
+    return 1;
+}
+
+static int lua_imu_read(lua_State *L)
+{
+    lua_imu_check_open(L);
     lua_newtable(L);
-    lua_newtable(L);
-    lua_pushnumber(L, 0.0);
-    lua_setfield(L, -2, "x");
-    lua_pushnumber(L, 0.0);
-    lua_setfield(L, -2, "y");
-    lua_pushnumber(L, 1.0);
-    lua_setfield(L, -2, "z");
-    lua_setfield(L, -2, "accel");
+    /* Stationary raw sample at 16384 LSB/g; no physical sensor is accessed. */
+    const char *axes[] = {"accel", "gyro"};
+    for (int i = 0; i < 2; ++i) {
+        lua_newtable(L);
+        lua_pushinteger(L, 0);
+        lua_setfield(L, -2, "x");
+        lua_pushinteger(L, 0);
+        lua_setfield(L, -2, "y");
+        lua_pushinteger(L, i == 0 ? 16384 : 0);
+        lua_setfield(L, -2, "z");
+        lua_setfield(L, -2, axes[i]);
+    }
+    lua_pushinteger(L, (lua_Integer)(emscripten_get_now() * 1000));
+    lua_setfield(L, -2, "sens_time");
+    lua_pushinteger(L, 0);
+    lua_setfield(L, -2, "status");
     return 1;
 }
 
 static int lua_imu_new(lua_State *L)
 {
-    (void)L;
+    luaL_argcheck(L, lua_gettop(L) == 1, 1, "expected one configuration table");
+    luaL_checktype(L, 1, LUA_TTABLE);
+    lua_getfield(L, 1, "device");
+    bool board = !lua_isnil(L, -1);
+    if (!board) {
+        lua_pop(L, 1);
+        lua_getfield(L, 1, "chip");
+    }
+    luaL_checktype(L, -1, LUA_TSTRING);
+    const char *name = lua_tostring(L, -1);
+    luaL_argcheck(L, name[0], 1, "empty sensor name");
+    if (!board && strcmp(name, "bmi270") && strcmp(name, "icm42670") && strcmp(name, "mpu6050")) {
+        return luaL_error(L, "imu.new: unsupported chip");
+    }
+    lua_pushnil(L);
+    while (lua_next(L, 1)) {
+        const char *key = lua_type(L, -2) == LUA_TSTRING ? lua_tostring(L, -2) : NULL;
+        bool valid = key && (board ? strcmp(key, "device") == 0 :
+            strcmp(key, "chip") == 0 || strcmp(key, "bus") == 0 || strcmp(key, "address") == 0 ||
+            strcmp(key, "int_gpio") == 0 || strcmp(key, "sdo_gpio") == 0);
+        if (!valid) return luaL_error(L, "imu.new: unsupported or mixed config fields");
+        lua_pop(L, 1);
+    }
+    if (!board) {
+        lua_getfield(L, 1, "bus");
+        luaL_checktype(L, -1, LUA_TTABLE);
+        lua_pop(L, 1);
+    }
+    static const luaL_Reg methods[] = {
+        {"read", lua_imu_read},
+        {"read_temperature", lua_imu_zero},
+        {"read_int_status", lua_imu_zero},
+        {"name", lua_imu_name},
+        {"close", lua_imu_close},
+        {NULL, NULL},
+    };
     lua_newtable(L);
-    lua_pushcfunction(L, lua_imu_read);
-    lua_setfield(L, -2, "read");
-    lua_pushcfunction(L, lua_true_noop);
-    lua_setfield(L, -2, "close");
+    luaL_setfuncs(L, methods, 0);
+    lua_pushstring(L, name);
+    lua_setfield(L, -2, "sensor_name");
     return 1;
 }
 
@@ -1012,6 +1086,8 @@ static int lua_i2c_new(lua_State *L)
 static int luaopen_i2c(lua_State *L)
 {
     lua_newtable(L);
+    lua_pushcfunction(L, lua_i2c_new);
+    lua_setfield(L, -2, "borrow");
     lua_pushcfunction(L, lua_i2c_new);
     lua_setfield(L, -2, "new");
     return 1;
@@ -1886,48 +1962,10 @@ static int luaopen_http_server(lua_State *L)
     return 1;
 }
 
-static int sim_lvgl_init(lua_State *L)
-{
-    int nargs = lua_gettop(L);
-    int height = (int)luaL_checkinteger(L, 4);
-    int min_buffer_lines = height;
-
-    if (nargs < 6 || lua_isnil(L, 6)) {
-        lua_settop(L, 5);
-        lua_newtable(L);
-        lua_pushinteger(L, min_buffer_lines);
-        lua_setfield(L, 6, "buffer_lines");
-        nargs = 6;
-    } else if (lua_istable(L, 6)) {
-        int buffer_lines;
-        lua_getfield(L, 6, "buffer_lines");
-        buffer_lines = lua_isnil(L, -1) ? 0 : (int)luaL_checkinteger(L, -1);
-        lua_pop(L, 1);
-        if (buffer_lines < min_buffer_lines) {
-            lua_pushinteger(L, min_buffer_lines);
-            lua_setfield(L, 6, "buffer_lines");
-        }
-    }
-
-    lua_pushvalue(L, lua_upvalueindex(1));
-    lua_insert(L, 1);
-    lua_call(L, nargs, LUA_MULTRET);
-    return lua_gettop(L);
-}
-
-static void sim_patch_lvgl_module(lua_State *L)
-{
-    lua_getfield(L, -1, "init");
-    if (lua_isfunction(L, -1)) {
-        lua_pushcclosure(L, sim_lvgl_init, 1);
-        lua_setfield(L, -2, "init");
-    } else {
-        lua_pop(L, 1);
-    }
-}
-
 static void sim_register_modules(lua_State *L)
 {
+    luaL_requiref(L, "display", luaopen_display, 1);
+    lua_pop(L, 1);
     luaL_requiref(L, "board_manager", luaopen_board_manager, 1);
     lua_pop(L, 1);
     luaL_requiref(L, "delay", luaopen_delay, 1);
@@ -1971,7 +2009,6 @@ static void sim_register_modules(lua_State *L)
     luaL_requiref(L, "system", luaopen_system, 1);
     lua_pop(L, 1);
     luaL_requiref(L, "lvgl", luaopen_lvgl, 1);
-    sim_patch_lvgl_module(L);
     lua_pop(L, 1);
 }
 
@@ -2013,10 +2050,14 @@ int esp_claw_sim_run_file(const char *path)
         return 1;
     }
     if (s_lua) {
+        lua_sethook(s_lua, NULL, 0, 0);
+        sim_display_cleanup(s_lua);
         (void)lua_lvgl_deinit_runtime();
         lua_close(s_lua);
+        s_lua = NULL;
     }
     s_lua = luaL_newstate();
+    if (!s_lua) { free(script); printf("Lua allocation failed\n"); return 1; }
     luaL_openlibs(s_lua);
     lua_sethook(s_lua, sim_lua_stop_hook, LUA_MASKCOUNT, 1000);
     sim_register_modules(s_lua);
@@ -2029,15 +2070,27 @@ int esp_claw_sim_run_file(const char *path)
     if (rc != LUA_OK) {
         printf("Lua error: %s\n", lua_tostring(s_lua, -1));
         lua_pop(s_lua, 1);
-        return 1;
     }
-    return 0;
+    lua_sethook(s_lua, NULL, 0, 0);
+    sim_display_cleanup(s_lua);
+    (void)lua_lvgl_deinit_runtime();
+    lua_close(s_lua);
+    s_lua = NULL;
+    display_service_stop();
+    return rc == LUA_OK ? 0 : 1;
 }
 
 EMSCRIPTEN_KEEPALIVE
 void esp_claw_sim_stop(void)
 {
     sim_set_stop_requested(true);
+}
+
+/* Expose live allocation size for lifecycle regression checks. */
+EMSCRIPTEN_KEEPALIVE
+size_t esp_claw_sim_heap_used(void)
+{
+    return mallinfo().uordblks;
 }
 
 int main(void)

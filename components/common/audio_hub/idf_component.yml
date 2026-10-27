@@ -1,7 +1,5 @@
 ## audio_hub — output mixer + input capture hub for the shared codec.
 dependencies:
-  claw_hw_registry:
-    path: ../claw_hw_registry
   espressif/esp_audio_effects:
     version: "^1.4.3" # S31 audio engine; old P4 revisions are outside this board profile.
   espressif/esp_codec_dev:

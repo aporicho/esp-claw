@@ -9,8 +9,6 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "app_claw_hw_bridge.h"
-#include "claw_hw_registry.h"
 #include "devices/dev_display_lcd/dev_display_lcd.h"
 #include "devices/dev_lcd_touch/dev_lcd_touch.h"
 #include "esp_board_manager_includes.h"
@@ -39,6 +37,7 @@ static const char *TAG = "display_service";
 #define DISPLAY_SERVICE_EXIT_GESTURE_START_HEIGHT 80
 #define DISPLAY_SERVICE_EXIT_GESTURE_MIN_DY 72
 #define DISPLAY_SERVICE_RAW_STAGING_BYTES (32 * 1024)
+#define DISPLAY_SERVICE_RAW_STAGING_MIN_BYTES (4 * 1024)
 
 typedef void (*display_service_scene_cleanup_cb_t)(void *owner_ctx, void *user_ctx);
 
@@ -120,11 +119,6 @@ typedef struct {
 } display_service_state_t;
 
 EXT_RAM_BSS_ATTR static display_service_state_t s_display;
-
-/* Exclusive leases held under "compositor/display" while the service runs;
- * NULL when not held. */
-static claw_hw_lease_handle_t s_display_lcd_lease;
-static claw_hw_lease_handle_t s_lcd_touch_lease;
 
 static esp_err_t display_service_scene_acquire_ex(const display_service_scene_config_t *config);
 static esp_err_t display_service_scene_load_screen(void *owner_ctx, lv_obj_t *screen);
@@ -651,34 +645,6 @@ esp_err_t display_service_start(const display_service_config_t *config)
         return ESP_OK;
     }
 
-    /* Lease display_lcd + (optional) lcd_touch exclusively under
-     * "compositor/display" before touching any hardware. On failure below
-     * we fall through to `fail:` which calls display_service_stop(); that
-     * release path drops both leases. */
-    ret = app_claw_hw_lease_device("display_lcd", "compositor/display",
-                                   CLAW_HW_MODE_EXCLUSIVE,
-                                   &s_display_lcd_lease, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "display_lcd lease failed: %s", esp_err_to_name(ret));
-        s_display_lcd_lease = NULL;
-        return ret;
-    }
-    {
-        /* Touch is optional. */
-        esp_err_t touch_err = app_claw_hw_lease_device("lcd_touch", "compositor/display",
-                                                       CLAW_HW_MODE_EXCLUSIVE,
-                                                       &s_lcd_touch_lease, NULL);
-        if (touch_err == ESP_ERR_NOT_FOUND) {
-            s_lcd_touch_lease = NULL;
-        } else if (touch_err != ESP_OK) {
-            ESP_LOGW(TAG, "lcd_touch lease failed: %s", esp_err_to_name(touch_err));
-            claw_hw_release(s_display_lcd_lease);
-            s_display_lcd_lease = NULL;
-            s_lcd_touch_lease = NULL;
-            return touch_err;
-        }
-    }
-
     ESP_GOTO_ON_ERROR(display_service_load_board_display(&lcd_cfg, &lcd_handles), fail, TAG, "load display failed");
     display_service_load_board_touch();
     s_display.info.touch_available = s_display.touch != NULL;
@@ -786,14 +752,6 @@ void display_service_stop(void)
     s_display.scene_flags = 0;
     s_display.dummy_draw_enabled = false;
     s_display.dummy_draw_suspended = false;
-    if (s_lcd_touch_lease) {
-        claw_hw_release(s_lcd_touch_lease);
-        s_lcd_touch_lease = NULL;
-    }
-    if (s_display_lcd_lease) {
-        claw_hw_release(s_display_lcd_lease);
-        s_display_lcd_lease = NULL;
-    }
 }
 
 bool display_service_is_started(void)
@@ -1328,6 +1286,21 @@ static esp_err_t display_service_exit_dummy_draw(const char *owner)
 
 static void display_service_swap_rgb565(uint8_t *dst, const uint8_t *src, size_t pixels)
 {
+    if ((((uintptr_t)dst | (uintptr_t)src) & 3U) == 0) {
+        /* Swap two pixels per aligned word, keeping their order unchanged. */
+        uint32_t *dst32 = (uint32_t *)dst;
+        const uint32_t *src32 = (const uint32_t *)src;
+        for (size_t i = 0; i < pixels / 2; ++i) {
+            uint32_t value = src32[i];
+            dst32[i] = ((value & 0x00ff00ffU) << 8) | ((value & 0xff00ff00U) >> 8);
+        }
+        if (pixels & 1U) {
+            size_t offset = (pixels - 1) * 2;
+            dst[offset] = src[offset + 1];
+            dst[offset + 1] = src[offset];
+        }
+        return;
+    }
     if ((((uintptr_t)dst | (uintptr_t)src) & 1U) == 0) {
         uint16_t *dst16 = (uint16_t *)dst;
         const uint16_t *src16 = (const uint16_t *)src;
@@ -1354,21 +1327,30 @@ static esp_err_t display_service_dummy_draw_blit_staged_locked(int x_start, int 
     if (stride_bytes == 0) stride_bytes = row_bytes;
     ESP_RETURN_ON_FALSE(stride_bytes >= row_bytes && (size_t)(height - 1) <= (SIZE_MAX - row_bytes) / stride_bytes,
                         ESP_ERR_INVALID_ARG, TAG, "RAW stride invalid");
-    int rows_per_chunk = DISPLAY_SERVICE_RAW_STAGING_BYTES / row_bytes;
-    if (rows_per_chunk == 0) rows_per_chunk = 1;
-    if (rows_per_chunk > height) rows_per_chunk = height;
-    const size_t needed = row_bytes * (size_t)rows_per_chunk;
-    if (s_display.raw_staging_bytes < needed) {
-        uint8_t *strip = heap_caps_aligned_alloc(16, needed, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-        if (strip == NULL) {
-            ESP_LOGW(TAG, "internal DMA staging allocation failed: %u bytes, using PSRAM", (unsigned)needed);
-            strip = heap_caps_aligned_alloc(16, needed, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_display.raw_staging_bytes < row_bytes) {
+        size_t capacity = row_bytes > DISPLAY_SERVICE_RAW_STAGING_BYTES ? row_bytes : DISPLAY_SERVICE_RAW_STAGING_BYTES;
+        const size_t minimum = row_bytes > DISPLAY_SERVICE_RAW_STAGING_MIN_BYTES ? row_bytes : DISPLAY_SERVICE_RAW_STAGING_MIN_BYTES;
+        uint8_t *strip = NULL;
+        /* Prefer a smaller DMA buffer to copying through PSRAM. Reuse it for every rectangle. */
+        for (;;) {
+            strip = heap_caps_aligned_alloc(16, capacity, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+            if (strip != NULL || capacity <= minimum) break;
+            capacity = capacity / 2 < minimum ? minimum : capacity / 2;
         }
-        ESP_RETURN_ON_FALSE(strip != NULL, ESP_ERR_NO_MEM, TAG, "RAW staging allocation failed: %u bytes", (unsigned)needed);
+        if (strip == NULL) {
+            capacity = row_bytes > DISPLAY_SERVICE_RAW_STAGING_BYTES ? row_bytes : DISPLAY_SERVICE_RAW_STAGING_BYTES;
+            ESP_LOGW(TAG, "internal DMA staging unavailable, using %u bytes in PSRAM", (unsigned)capacity);
+            strip = heap_caps_aligned_alloc(16, capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        } else {
+            ESP_LOGI(TAG, "RAW DMA staging: %u bytes", (unsigned)capacity);
+        }
+        ESP_RETURN_ON_FALSE(strip != NULL, ESP_ERR_NO_MEM, TAG, "RAW staging allocation failed: %u bytes", (unsigned)capacity);
         heap_caps_free(s_display.raw_staging);
         s_display.raw_staging = strip;
-        s_display.raw_staging_bytes = needed;
+        s_display.raw_staging_bytes = capacity;
     }
+    int rows_per_chunk = s_display.raw_staging_bytes / row_bytes;
+    if (rows_per_chunk > height) rows_per_chunk = height;
     const uint8_t *source = frame_buffer;
     for (int row = 0; row < height; row += rows_per_chunk) {
         const int rows = height - row < rows_per_chunk ? height - row : rows_per_chunk;

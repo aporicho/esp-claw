@@ -45,6 +45,11 @@ static void claw_core_free_runtime(claw_core_state_t *core)
         vSemaphoreDelete(core->llm_lock);
     }
     if (core->request_queue) {
+        claw_core_request_item_t *item = calloc(1, sizeof(*item));
+        if (item) {
+            while (xQueueReceive(core->request_queue, item, 0) == pdTRUE) claw_core_free_request_item(item);
+            free(item);
+        }
         vQueueDelete(core->request_queue);
     }
     if (core->response_queue) {
@@ -134,6 +139,7 @@ esp_err_t claw_core_create(const claw_core_config_t *config, claw_core_handle_t 
 
     llm_config.api_key = config->api_key;
     llm_config.backend_type = config->backend_type;
+    llm_config.endpoint_provider = config->endpoint_provider;
     llm_config.model = config->model;
     llm_config.base_url = config->base_url;
     llm_config.auth_type = config->auth_type;
@@ -170,6 +176,7 @@ esp_err_t claw_core_update_llm_config(claw_core_handle_t core,
 
     next.api_key = config->api_key;
     next.backend_type = config->backend_type;
+    next.endpoint_provider = config->endpoint_provider;
     next.model = config->model;
     next.base_url = config->base_url;
     next.auth_type = config->auth_type;

@@ -6,7 +6,6 @@
 #include "app_claw.h"
 #include "audio_hub.h"
 #include "app_claw_cli.h"
-#include "app_claw_hw_bridge.h"
 #include "app_capabilities.h"
 #if CONFIG_APP_CLAW_SYSTEM_UI_ENABLE
 #include "system_ui.h"
@@ -536,6 +535,25 @@ claw_core_handle_t app_claw_get_core(void)
 #endif
 }
 
+#if CONFIG_APP_CLAW_CAP_MEMORY
+static esp_err_t app_claw_persist_context(const claw_core_context_persist_batch_t *batch, void *ctx)
+{
+    esp_err_t err = claw_memory_persist_context_callback(batch, ctx);
+#if CONFIG_APP_CLAW_CAP_SESSION_MGR
+    if (err == ESP_OK) {
+        for (size_t i = 0; i < batch->record_count; i++) {
+            if (batch->records[i].type == CLAW_CORE_CONTEXT_RECORD_USER || batch->records[i].type == CLAW_CORE_CONTEXT_RECORD_ASSISTANT_FINAL) {
+                esp_err_t catalog_err = claw_session_mgr_catalog_touch(batch->session_id, batch->records[i].text);
+                if (catalog_err != ESP_OK) ESP_LOGW(TAG, "Session metadata update failed: %s", esp_err_to_name(catalog_err));
+                break;
+            }
+        }
+    }
+#endif
+    return err;
+}
+#endif
+
 #if CONFIG_APP_CLAW_CAP_SESSION_MGR && (CONFIG_APP_CLAW_CAP_MEMORY || CONFIG_APP_CLAW_CAP_SKILL_MGR)
 static esp_err_t app_claw_delete_session_history(const char *session_id,
                                                  bool *out_deleted_any,
@@ -625,6 +643,7 @@ static esp_err_t init_memory(const app_claw_config_t *config, const app_claw_sto
         .llm = {
             .api_key = config->llm_api_key,
             .backend_type = config->llm_backend_type,
+            .endpoint_provider = config->llm_endpoint_provider,
             .model = config->llm_model,
             .base_url = config->llm_base_url,
             .auth_type = config->llm_auth_type,
@@ -716,6 +735,7 @@ static void app_claw_fill_core_config(const app_claw_config_t *config, claw_core
     memset(core_config, 0, sizeof(*core_config));
     core_config->api_key = config->llm_api_key;
     core_config->backend_type = config->llm_backend_type;
+    core_config->endpoint_provider = config->llm_endpoint_provider;
     core_config->model = config->llm_model;
     core_config->base_url = config->llm_base_url;
     core_config->auth_type = config->llm_auth_type;
@@ -731,12 +751,12 @@ static void app_claw_fill_core_config(const app_claw_config_t *config, claw_core
     core_config->system_prompt = APP_SYSTEM_PROMPT;
 #if CONFIG_APP_CLAW_CAP_MEMORY
 #if CONFIG_APP_CLAW_MEMORY_MODE_FULL
-    core_config->persist_context = claw_memory_persist_context_callback;
+    core_config->persist_context = app_claw_persist_context;
     core_config->request_gate = claw_memory_request_gate_callback;
     core_config->on_request_start = claw_memory_request_start_callback;
     core_config->collect_stage_note = claw_memory_stage_note_callback;
 #else
-    core_config->persist_context = claw_memory_persist_context_callback;
+    core_config->persist_context = app_claw_persist_context;
     core_config->request_gate = claw_memory_request_gate_callback;
 #endif
 #endif
@@ -808,7 +828,7 @@ static esp_err_t build_storage_paths(app_claw_storage_paths_t *paths)
     return ESP_OK;
 }
 
-esp_err_t app_claw_start(const app_claw_config_t *config)
+esp_err_t app_claw_start(const app_claw_config_t *config, claw_hw_registry_handle_t registry)
 {
     app_claw_storage_paths_t paths;
 #if CONFIG_APP_CLAW_CAP_CORE
@@ -830,11 +850,10 @@ esp_err_t app_claw_start(const app_claw_config_t *config)
     ESP_RETURN_ON_ERROR(app_claw_store_current_config(config), TAG, "Failed to store Claw config");
     ESP_RETURN_ON_ERROR(build_storage_paths(&paths), TAG, "Failed to resolve storage paths");
 
-    esp_err_t hw_err = app_claw_hw_bridge_register_board_devices();
-    if (hw_err != ESP_OK) {
-        ESP_LOGW(TAG, "hw bridge register skipped/failed: %s", esp_err_to_name(hw_err));
-    }
-
+    ESP_RETURN_ON_FALSE(registry != NULL, ESP_ERR_INVALID_ARG, TAG, "hardware registry is required");
+#if CONFIG_APP_CLAW_CAP_LUA
+    ESP_RETURN_ON_ERROR(cap_lua_set_hw_registry(registry), TAG, "bind Lua hardware registry failed");
+#endif
     app_claw_audio_start_service();
 
 #if CONFIG_APP_CLAW_CAP_EVENT_ROUTER
@@ -957,7 +976,7 @@ esp_err_t app_claw_start(const app_claw_config_t *config)
 #endif
 
 #if CONFIG_APP_CLAW_ENABLE_CLI
-    ESP_RETURN_ON_ERROR(app_claw_cli_start(), TAG, "Failed to start CLI");
+    ESP_RETURN_ON_ERROR(app_claw_cli_start(registry), TAG, "Failed to start CLI");
 #endif
 #if CONFIG_APP_CLAW_CAP_EVENT_ROUTER
     ESP_RETURN_ON_ERROR(app_claw_publish_startup_event(), TAG,
